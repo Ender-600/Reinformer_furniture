@@ -18,6 +18,8 @@ class ReinFormer(nn.Module):
         target_entropy,
         max_timestep=4096,
         dt_mask=False,
+        vision1_dim: int = 0,
+        vision2_dim: int = 0,
     ):
         super().__init__()
 
@@ -25,9 +27,10 @@ class ReinFormer(nn.Module):
         self.act_dim = act_dim
         self.h_dim = h_dim
 
-
+        ### vision token
+        self.n_vision = int(vision1_dim > 0) + int(vision2_dim > 0)
         ### transformer blocks
-        self.num_inputs = 3
+        self.num_inputs = 3+ self.n_vision  # state, rtg, action, vision1, vision2
         input_seq_len = self.num_inputs * context_len
         blocks = [
             Block(
@@ -49,7 +52,9 @@ class ReinFormer(nn.Module):
         self.embed_state = nn.Linear(state_dim, h_dim)
         self.embed_rtg = nn.Linear(1, h_dim)
         self.embed_action = nn.Linear(act_dim, h_dim)
-
+        self.embed_vision1 = nn.Linear(vision1_dim, h_dim) if vision1_dim > 0 else None
+        self.embed_vision2 = nn.Linear(vision2_dim, h_dim) if vision2_dim > 0 else None
+        
         ### prediction heads
         self.predict_rtg = nn.Linear(h_dim, 1)
         # stochastic action
@@ -63,7 +68,10 @@ class ReinFormer(nn.Module):
 
     def temperature(self):
         return self.log_temperature.exp()
-
+    
+    @torch.no_grad()
+    def _infer_nvision(self):
+        return self.n_vision
 
     def forward(
         self, 
@@ -71,52 +79,46 @@ class ReinFormer(nn.Module):
         states, 
         actions, 
         returns_to_go,
+        vision1 = None,
+        vision2 = None
     ):
 
         B, T, _ = states.shape
 
-        time_embeddings = self.embed_timestep(timesteps)
-        # time embeddings are treated similar to positional embeddings
+        time_embeddings = self.embed_timestep(timesteps)  # (B, T, h)
         state_embeddings = self.embed_state(states) + time_embeddings
+        rtg_embeddings   = self.embed_rtg(returns_to_go) + time_embeddings
         action_embeddings = self.embed_action(actions) + time_embeddings
-        rtg_embeddings = self.embed_rtg(returns_to_go) + time_embeddings
 
-        # stack states, RTGs, and actions and reshape sequence as
-        # (s_0, R_0, a_0, s_1, R_1, a_1, s_2, R_2, a_2 ...)
-        h = (
-            torch.stack(
-                (
-                    state_embeddings, 
-                    rtg_embeddings, 
-                    action_embeddings,
-                ),
-                dim=1,
-            )
-            .permute(0, 2, 1, 3)
-            .reshape(B, self.num_inputs * T, self.h_dim)
-        )
+        tokens = [state_embeddings]
 
+        # 视觉 token（按顺序插在 state 之后、rtg 之前）
+        if self.embed_vision1 is not None and vision1 is not None and vision1.shape[-1] > 0:
+            v1_emb = self.embed_vision1(vision1) + time_embeddings
+            tokens.append(v1_emb)
+        if self.embed_vision2 is not None and vision2 is not None and vision2.shape[-1] > 0:
+            v2_emb = self.embed_vision2(vision2) + time_embeddings
+            tokens.append(v2_emb)
+
+        tokens += [rtg_embeddings, action_embeddings]  # 末尾依次是 rtg, action
+
+        # 堆叠成 (B, num_inputs*T, h_dim)
+        h = torch.stack(tokens, dim=1)              # (B, num_inputs, T, h)
+        h = h.permute(0, 2, 1, 3).reshape(B, self.num_inputs * T, self.h_dim)
         h = self.embed_ln(h)
 
-        # transformer and prediction
-        h = self.transformer(h)
+        # transformer
+        h = self.transformer(h)                     # (B, num_inputs*T, h)
+        h = h.reshape(B, T, self.num_inputs, self.h_dim).permute(0, 2, 1, 3)  # (B, num_inputs, T, h)
 
-        # get h reshaped such that its size = (B x 3 x T x h_dim) and
-        # h[:, 0, t] is conditioned on the input sequence s_0, R_0, a_0 ... s_t
-        # h[:, 1, t] is conditioned on the input sequence s_0, R_0, a_0 ... s_t, R_t
-        # h[:, 2, t] is conditioned on the input sequence s_0, R_0, a_0 ... s_t, R_t, a_t
-        # that is, for each timestep (t) we have 3 output embeddings from the transformer,
-        # each conditioned on all previous timesteps plus 
-        # the 3 input variables at that timestep (s_t, R_t, a_t) in sequence.
-        h = h.reshape(B, T, self.num_inputs, self.h_dim).permute(0, 2, 1, 3)
+        # 依据 token 布局做预测的索引
+        idx_state  = 0
+        idx_rtg    = 1 + self.n_vision
+        idx_action = idx_rtg + 1
 
-        # get predictions
-        rtg_preds  = self.predict_rtg(h[:, 0])            # predict rtg given s
-        action_dist_preds = self.predict_action(h[:, 1])  # predict action given s, R
-        state_preds = self.predict_state(h[:, 2])         # predict next state given s, R, a
+        # predictions
+        rtg_preds         = self.predict_rtg(h[:, idx_state])   # given s
+        action_dist_preds = self.predict_action(h[:, idx_rtg])  # given s,(v1,v2),R
+        state_preds       = self.predict_state(h[:, idx_action]) # given s,(v1,v2),R,a
 
-        return (
-            rtg_preds,
-            action_dist_preds, 
-            state_preds, 
-        )
+        return rtg_preds, action_dist_preds, state_preds
