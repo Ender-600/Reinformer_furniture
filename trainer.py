@@ -3,6 +3,18 @@ import torch.nn.functional as F
 from model import ReinFormer
 from lamb import Lamb
 
+def masked_mean(x, mask, eps: float = 1e-8):
+    """
+    x:   (B,T,...) 或 (B,T)
+    mask:(B,T) -> 1 有效, 0 无效
+    返回按 mask 的平均
+    """
+    while mask.dim() < x.dim():
+        mask = mask.unsqueeze(-1)
+    num = (x * mask).sum()
+    den = mask.sum().clamp_min(eps)
+    return num / den
+
 
 
 class ReinFormerTrainer:
@@ -19,6 +31,11 @@ class ReinFormerTrainer:
         self.act_dim = act_dim
         self.device = device
         self.grad_norm = variant["grad_norm"]
+        self.tau = variant["tau"]                       # expectile
+        self.context_len = variant["context_len"]
+
+        v1_dim = variant.get("vision1_dim", 0)
+        v2_dim = variant.get("vision2_dim", 0)
 
         self.model = ReinFormer(
             state_dim=state_dim,
@@ -29,7 +46,11 @@ class ReinFormerTrainer:
             n_heads=variant["n_heads"],
             drop_p=variant["dropout_p"],
             init_temperature=variant["init_temperature"],
-            target_entropy=-self.act_dim
+            target_entropy=-self.act_dim,
+            max_timestep=variant.get("max_timestep", 4096),
+            dt_mask=variant.get("dt_mask", False),
+            vision1_dim=v1_dim,
+            vision2_dim=v2_dim,
         ).to(self.device)
 
         self.optimizer = Lamb(
@@ -62,61 +83,64 @@ class ReinFormerTrainer:
         returns_to_go,
         rewards,
         traj_mask,
+        vision1=None,   # (B,T,Dv1) or None
+        vision2=None,   # (B,T,Dv2) or None
     ):
         self.model.train()
         # data to gpu ------------------------------------------------
         timesteps = timesteps.to(self.device)      # B x T
         states = states.to(self.device)            # B x T x state_dim
         actions = actions.to(self.device)          # B x T x act_dim
-        returns_to_go = returns_to_go.to(self.device).unsqueeze(
-            dim=-1
-        )                                          # B x T x 1
-        
-        rewards = rewards.to(self.device).unsqueeze(
-            dim=-1
-        )                                          # B x T x 1
-        traj_mask = traj_mask.to(self.device)      # B x T
+        returns_to_go = returns_to_go.to(self.device).unsqueeze(-1)  # (B,T,1)
+        rewards      = rewards.to(self.device).unsqueeze(-1)         # (B,T,1)
+        traj_mask    = traj_mask.to(self.device).float()    # (B,T)
+
+        # vision --------------------------------------------------
+        if vision1 is not None:
+            vision1 = vision1.to(self.device)
+            if vision1.ndim == 5:  # (B,T,3,224,224)
+                raise ValueError(
+                    "trainer 收到 raw 像素 (B,T,3,224,224)。请用 cache 特征（R3M/VIP），"
+                    "或在进入 trainer 前自行加 CNN encoder。"
+                )
+            if vision1.shape[-1] == 0:
+                vision1 = None
+        if vision2 is not None:
+            vision2 = vision2.to(self.device)
+            if vision2.ndim == 5:
+                raise ValueError(
+                    "trainer 收到 raw 像素 (B,T,3,224,224)。请用 cache 特征（R3M/VIP），"
+                    "或在进入 trainer 前自行加 CNN encoder。"
+                )
+            if vision2.shape[-1] == 0:
+                vision2 = None
 
         # model forward ----------------------------------------------
-        (
-            returns_to_go_preds,
-            actions_dist_preds,
-            _,
-        ) = self.model.forward(
+        rtg_preds, action_dist, _ = self.model(
             timesteps=timesteps,
             states=states,
             actions=actions,
             returns_to_go=returns_to_go,
+            vision1=vision1,
+            vision2=vision2,
         )
-
-        returns_to_go_target = torch.clone(returns_to_go).view(
-            -1, 1
-        )[
-            traj_mask.view(-1,) > 0
-        ]
-        returns_to_go_preds = returns_to_go_preds.view(-1, 1)[
-            traj_mask.view(-1,) > 0
-        ]
 
         # returns_to_go_loss -----------------------------------------
-        norm = returns_to_go_target.abs().mean()
-        u = (returns_to_go_target - returns_to_go_preds) / norm
-        returns_to_go_loss = torch.mean(
-            torch.abs(
-                self.tau - (u < 0).float()
-            ) * u ** 2
-        )
-        # action_loss ------------------------------------------------
-        actions_target = torch.clone(actions)
-        log_likelihood = actions_dist_preds.log_prob(
-            actions_target
-            ).sum(axis=2)[
-            traj_mask > 0
-        ].mean()
-        entropy = actions_dist_preds.entropy().sum(axis=2).mean()
-        action_loss = -(log_likelihood + self.model.temperature().detach() * entropy)
+        # u = (target - pred)/norm, 其中 target=returns_to_go
+        target_rtg = returns_to_go                              # (B,T,1)
+        pred_rtg   = rtg_preds                                   # (B,T,1)
+        norm = target_rtg.abs().mean().clamp_min(1e-6)
+        u = (target_rtg - pred_rtg) / norm                       # (B,T,1)
+        rtg_loss = masked_mean(torch.abs(self.tau - (u < 0).float()) * (u ** 2), traj_mask)
 
-        loss = returns_to_go_loss + action_loss
+        # action_loss ------------------------------------------------
+        # log_prob/entropy: (B,T,Da) -> sum over action dims -> (B,T)
+        log_prob = action_dist.log_prob(actions).sum(dim=-1)     # (B,T)
+        entropy  = action_dist.entropy().sum(dim=-1)             # (B,T)
+
+        action_loss = -masked_mean(log_prob + self.model.temperature().detach() * entropy, traj_mask) # 取负号是因为我们最小化 loss
+
+        loss = rtg_loss + action_loss
 
         # optimization -----------------------------------------------
         self.optimizer.zero_grad()
@@ -128,12 +152,22 @@ class ReinFormerTrainer:
         self.optimizer.step()
 
         self.log_temperature_optimizer.zero_grad()
-        temperature_loss = (
-            self.model.temperature() * (entropy - self.model.target_entropy).detach()
-        )
+        # temperature_loss = (
+        #     self.model.temperature() * (entropy - self.model.target_entropy).detach()
+        # )
+        temperature_loss = self.model.temperature() * (
+            masked_mean(entropy, traj_mask) - self.model.target_entropy
+        ).detach()
         temperature_loss.backward()
         self.log_temperature_optimizer.step()
 
         self.scheduler.step()
 
-        return loss.detach().cpu().item()
+        # return loss.detach().cpu().item()
+        return {
+            "loss": float(loss.detach().cpu()),
+            "rtg_loss": float(rtg_loss.detach().cpu()),
+            "action_loss": float(action_loss.detach().cpu()),
+            "entropy": float(masked_mean(entropy, traj_mask).detach().cpu()),
+            "temperature": float(self.model.temperature().detach().cpu()),
+        }

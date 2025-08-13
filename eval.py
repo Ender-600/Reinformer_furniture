@@ -1,108 +1,77 @@
 import torch
-import numpy as np
+import torch.nn.functional as F
+from collections import defaultdict
 
-
-def Reinformer_eval(
+@torch.no_grad()
+def evaluate_offline(
     model,
     device,
-    context_len,
-    env,
-    state_mean,
-    state_std,
-    num_eval_ep=10,
-    max_test_ep_len=1000,
+    val_loader,          # 验证集 DataLoader（与你训练集同构的 batch：8元组）
+    tau: float = 0.99,   # expectile 超参，跟训练一致
 ):
-    eval_batch_size = 1
-    returns = []
-    lengths = []
-
-    state_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-
-    state_mean = torch.from_numpy(state_mean).to(device)
-    state_std = torch.from_numpy(state_std).to(device)
-
-    timesteps = torch.arange(start=0, end=max_test_ep_len, step=1)
-    timesteps = timesteps.repeat(eval_batch_size, 1).to(device)
-
     model.eval()
-    with torch.no_grad():
-        for _ in range(num_eval_ep):
-            # zeros place holders
-            actions = torch.zeros(
-                (eval_batch_size, max_test_ep_len, act_dim),
-                dtype=torch.float32,
-                device=device,
-            )
-            states = torch.zeros(
-                (eval_batch_size, max_test_ep_len, state_dim),
-                dtype=torch.float32,
-                device=device,
-            )
-            returns_to_go = torch.zeros(
-                (eval_batch_size, max_test_ep_len, 1),
-                dtype=torch.float32,
-                device=device,
-            )
+    meters = defaultdict(float)
+    n_batches = 0
 
-            # init episode
-            running_state = env.reset()
-            episode_return = 0
-            episode_length = 0
+    for batch in val_loader:
+        (
+            timesteps,   # (B,T)
+            states,      # (B,T,Ds)
+            actions,     # (B,T,Da)
+            returns_to_go, # (B,T)
+            rewards,     # (B,T)
+            traj_mask,   # (B,T)
+            vision1,     # (B,T,Dv1) 或 (B,T,0)
+            vision2,     # (B,T,Dv2) 或 (B,T,0)
+        ) = batch
 
-            for t in range(max_test_ep_len):
-                # add state in placeholder and normalize
-                states[0, t] = torch.from_numpy(running_state).to(device)
-                states[0, t] = (states[0, t] - state_mean) / state_std
-                # predict rtg by model
-                if t < context_len:
-                    rtg_preds, _, _ = model.forward(
-                        timesteps[:, :context_len],
-                        states[:, :context_len],
-                        actions[:, :context_len],
-                        returns_to_go[:, :context_len],
-                    )
-                    rtg = rtg_preds[0, t].detach()
-                else:
-                    rtg_preds, _, _ = model.forward(
-                        timesteps[:, t - context_len + 1 : t + 1],
-                        states[:, t - context_len + 1 : t + 1],
-                        actions[:, t - context_len + 1 : t + 1],
-                        returns_to_go[:, t - context_len + 1 : t + 1],
-                    )
-                    rtg = rtg_preds[0, -1].detach()
-                # add rtg in placeholder
-                returns_to_go[0, t] = rtg
-                # take action by model
-                if t < context_len:
-                    _, act_dist_preds, _ = model.forward(
-                        timesteps[:, :context_len],
-                        states[:, :context_len],
-                        actions[:, :context_len],
-                        returns_to_go[:, :context_len],
-                    )
-                    act = act_dist_preds.mean.reshape(eval_batch_size, -1, act_dim)[0, t].detach()
-                else:
-                    _, act_dist_preds, _ = model.forward(
-                        timesteps[:, t - context_len + 1 : t + 1],
-                        states[:, t - context_len + 1 : t + 1],
-                        actions[:, t - context_len + 1 : t + 1],
-                        returns_to_go[:, t - context_len + 1 : t + 1],
-                    )
-                    act = act_dist_preds.mean.reshape(eval_batch_size, -1, act_dim)[0, -1].detach()
-                # env step
-                running_state, running_reward, done, _ = env.step(
-                    act.cpu().numpy()
-                )
-                # add action in placeholder
-                actions[0, t] = act
-                # calculate return and episode length
-                episode_return += running_reward
-                episode_length += 1
-                # terminate
-                if done:
-                    returns.append(episode_return)
-                    lengths.append(episode_length)
-                    break
-    
-    return np.array(returns).mean(), np.array(returns).std(), np.array(lengths).mean(), np.array(lengths).mean()
+        # to device
+        timesteps    = timesteps.to(device)
+        states       = states.to(device)
+        actions      = actions.to(device)
+        returns_to_go= returns_to_go.to(device).unsqueeze(-1)  # (B,T,1)
+        traj_mask    = traj_mask.to(device)
+
+        v1_in = vision1.to(device) if (hasattr(vision1, "shape") and vision1.shape[-1] > 0) else None
+        v2_in = vision2.to(device) if (hasattr(vision2, "shape") and vision2.shape[-1] > 0) else None
+
+        # forward（注意把视觉特征传进去；如果没用就是 None）
+        rtg_pred, act_dist, state_pred = model(
+            timesteps=timesteps,
+            states=states,
+            actions=actions,
+            returns_to_go=returns_to_go,
+            vision1=v1_in,
+            vision2=v2_in,
+        )
+
+        # --- RTG expectile loss（与训练同式） ---
+        norm = returns_to_go.abs().mean().clamp_min(1e-6)
+        u = (returns_to_go - rtg_pred) / norm
+        rtg_loss = torch.abs(tau - (u < 0).float()) * (u ** 2)          # (B,T,1)
+        # masked mean 到标量
+        while traj_mask.dim() < rtg_loss.dim():
+            traj_mask = traj_mask.unsqueeze(-1)
+        rtg_loss = (rtg_loss * traj_mask).sum() / traj_mask.sum().clamp_min(1e-8)
+
+        # --- Action NLL ---
+        nll = -act_dist.log_prob(actions).sum(-1)                        # (B,T)
+        nll = (nll * traj_mask.squeeze(-1)).sum() / traj_mask.squeeze(-1).sum().clamp_min(1e-8)
+
+        # --- State MSE ---
+        smse = F.mse_loss(state_pred, states, reduction='none').sum(-1)  # (B,T)
+        smse = (smse * traj_mask.squeeze(-1)).sum() / traj_mask.squeeze(-1).sum().clamp_min(1e-8)
+
+        # --- Entropy（可选监控） ---
+        ent = act_dist.entropy().sum(-1)                                 # (B,T)
+        ent = (ent * traj_mask.squeeze(-1)).sum() / traj_mask.squeeze(-1).sum().clamp_min(1e-8)
+
+        meters["rtg_loss"]   += rtg_loss.item()
+        meters["action_nll"] += nll.item()
+        meters["state_mse"]  += smse.item()
+        meters["entropy"]    += ent.item()
+        n_batches += 1
+
+    for k in meters:
+        meters[k] /= max(n_batches, 1)
+    return dict(meters)
