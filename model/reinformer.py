@@ -62,8 +62,9 @@ class ReinFormer(nn.Module):
         self.predict_state = nn.Linear(h_dim, state_dim)
 
         # For entropy
-        self.log_temperature = torch.tensor(np.log(init_temperature))
-        self.log_temperature.requires_grad = True
+        self.log_temperature = nn.Parameter(
+            torch.tensor(np.log(init_temperature), dtype=torch.float32)
+        )
         self.target_entropy = target_entropy
 
     def temperature(self):
